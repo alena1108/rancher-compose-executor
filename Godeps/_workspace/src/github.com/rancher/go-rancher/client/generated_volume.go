@@ -19,6 +19,8 @@ type Volume struct {
 
 	DriverOpts map[string]interface{} `json:"driverOpts,omitempty" yaml:"driver_opts,omitempty"`
 
+	ExternalId string `json:"externalId,omitempty" yaml:"external_id,omitempty"`
+
 	ImageId string `json:"imageId,omitempty" yaml:"image_id,omitempty"`
 
 	InstanceId string `json:"instanceId,omitempty" yaml:"instance_id,omitempty"`
@@ -61,6 +63,8 @@ type VolumeOperations interface {
 	Update(existing *Volume, updates interface{}) (*Volume, error)
 	ById(id string) (*Volume, error)
 	Delete(container *Volume) error
+
+	ActionActivate(*Volume) (*Volume, error)
 
 	ActionAllocate(*Volume) (*Volume, error)
 
@@ -106,11 +110,25 @@ func (c *VolumeClient) List(opts *ListOpts) (*VolumeCollection, error) {
 func (c *VolumeClient) ById(id string) (*Volume, error) {
 	resp := &Volume{}
 	err := c.rancherClient.doById(VOLUME_TYPE, id, resp)
+	if apiError, ok := err.(*ApiError); ok {
+		if apiError.StatusCode == 404 {
+			return nil, nil
+		}
+	}
 	return resp, err
 }
 
 func (c *VolumeClient) Delete(container *Volume) error {
 	return c.rancherClient.doResourceDelete(VOLUME_TYPE, &container.Resource)
+}
+
+func (c *VolumeClient) ActionActivate(resource *Volume) (*Volume, error) {
+
+	resp := &Volume{}
+
+	err := c.rancherClient.doAction(VOLUME_TYPE, "activate", &resource.Resource, nil, resp)
+
+	return resp, err
 }
 
 func (c *VolumeClient) ActionAllocate(resource *Volume) (*Volume, error) {

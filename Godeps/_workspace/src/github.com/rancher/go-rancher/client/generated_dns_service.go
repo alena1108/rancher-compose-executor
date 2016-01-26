@@ -17,9 +17,13 @@ type DnsService struct {
 
 	EnvironmentId string `json:"environmentId,omitempty" yaml:"environment_id,omitempty"`
 
+	ExternalId string `json:"externalId,omitempty" yaml:"external_id,omitempty"`
+
+	Fqdn string `json:"fqdn,omitempty" yaml:"fqdn,omitempty"`
+
 	Kind string `json:"kind,omitempty" yaml:"kind,omitempty"`
 
-	LaunchConfig LaunchConfig `json:"launchConfig,omitempty" yaml:"launch_config,omitempty"`
+	LaunchConfig *LaunchConfig `json:"launchConfig,omitempty" yaml:"launch_config,omitempty"`
 
 	Metadata map[string]interface{} `json:"metadata,omitempty" yaml:"metadata,omitempty"`
 
@@ -28,8 +32,6 @@ type DnsService struct {
 	RemoveTime string `json:"removeTime,omitempty" yaml:"remove_time,omitempty"`
 
 	Removed string `json:"removed,omitempty" yaml:"removed,omitempty"`
-
-	SelectorContainer string `json:"selectorContainer,omitempty" yaml:"selector_container,omitempty"`
 
 	SelectorLink string `json:"selectorLink,omitempty" yaml:"selector_link,omitempty"`
 
@@ -66,15 +68,23 @@ type DnsServiceOperations interface {
 
 	ActionAddservicelink(*DnsService, *AddRemoveServiceLinkInput) (*Service, error)
 
+	ActionCancelrollback(*DnsService) (*Service, error)
+
 	ActionCancelupgrade(*DnsService) (*Service, error)
 
 	ActionCreate(*DnsService) (*Service, error)
 
 	ActionDeactivate(*DnsService) (*Service, error)
 
+	ActionFinishupgrade(*DnsService) (*Service, error)
+
 	ActionRemove(*DnsService) (*Service, error)
 
 	ActionRemoveservicelink(*DnsService, *AddRemoveServiceLinkInput) (*Service, error)
+
+	ActionRestart(*DnsService, *ServiceRestart) (*Service, error)
+
+	ActionRollback(*DnsService) (*Service, error)
 
 	ActionSetservicelinks(*DnsService, *SetServiceLinksInput) (*Service, error)
 
@@ -110,6 +120,11 @@ func (c *DnsServiceClient) List(opts *ListOpts) (*DnsServiceCollection, error) {
 func (c *DnsServiceClient) ById(id string) (*DnsService, error) {
 	resp := &DnsService{}
 	err := c.rancherClient.doById(DNS_SERVICE_TYPE, id, resp)
+	if apiError, ok := err.(*ApiError); ok {
+		if apiError.StatusCode == 404 {
+			return nil, nil
+		}
+	}
 	return resp, err
 }
 
@@ -131,6 +146,15 @@ func (c *DnsServiceClient) ActionAddservicelink(resource *DnsService, input *Add
 	resp := &Service{}
 
 	err := c.rancherClient.doAction(DNS_SERVICE_TYPE, "addservicelink", &resource.Resource, input, resp)
+
+	return resp, err
+}
+
+func (c *DnsServiceClient) ActionCancelrollback(resource *DnsService) (*Service, error) {
+
+	resp := &Service{}
+
+	err := c.rancherClient.doAction(DNS_SERVICE_TYPE, "cancelrollback", &resource.Resource, nil, resp)
 
 	return resp, err
 }
@@ -162,6 +186,15 @@ func (c *DnsServiceClient) ActionDeactivate(resource *DnsService) (*Service, err
 	return resp, err
 }
 
+func (c *DnsServiceClient) ActionFinishupgrade(resource *DnsService) (*Service, error) {
+
+	resp := &Service{}
+
+	err := c.rancherClient.doAction(DNS_SERVICE_TYPE, "finishupgrade", &resource.Resource, nil, resp)
+
+	return resp, err
+}
+
 func (c *DnsServiceClient) ActionRemove(resource *DnsService) (*Service, error) {
 
 	resp := &Service{}
@@ -176,6 +209,24 @@ func (c *DnsServiceClient) ActionRemoveservicelink(resource *DnsService, input *
 	resp := &Service{}
 
 	err := c.rancherClient.doAction(DNS_SERVICE_TYPE, "removeservicelink", &resource.Resource, input, resp)
+
+	return resp, err
+}
+
+func (c *DnsServiceClient) ActionRestart(resource *DnsService, input *ServiceRestart) (*Service, error) {
+
+	resp := &Service{}
+
+	err := c.rancherClient.doAction(DNS_SERVICE_TYPE, "restart", &resource.Resource, input, resp)
+
+	return resp, err
+}
+
+func (c *DnsServiceClient) ActionRollback(resource *DnsService) (*Service, error) {
+
+	resp := &Service{}
+
+	err := c.rancherClient.doAction(DNS_SERVICE_TYPE, "rollback", &resource.Resource, nil, resp)
 
 	return resp, err
 }

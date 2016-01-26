@@ -6,29 +6,15 @@ import (
 	"io"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/Sirupsen/logrus"
 	"github.com/docker/docker/runconfig"
 	"github.com/docker/libcompose/docker"
 	"github.com/docker/libcompose/project"
-	"github.com/docker/libcompose/utils"
 	"github.com/gorilla/websocket"
 	rancherClient "github.com/rancher/go-rancher/client"
 	"github.com/rancher/go-rancher/hostaccess"
-)
-
-type serviceType int
-
-const (
-	LB_IMAGE       = "rancher/load-balancer-service"
-	DNS_IMAGE      = "rancher/dns-service"
-	EXTERNAL_IMAGE = "rancher/external-service"
-
-	rancherType         = serviceType(iota)
-	lbServiceType       = serviceType(iota)
-	dnsServiceType      = serviceType(iota)
-	externalServiceType = serviceType(iota)
+	rUtils "github.com/rancher/rancher-compose/utils"
 )
 
 type Link struct {
@@ -57,6 +43,17 @@ func (r *RancherService) Config() *project.ServiceConfig {
 	return r.serviceConfig
 }
 
+func (r *RancherService) Context() *Context {
+	return r.context
+}
+
+func (r *RancherService) RancherConfig() RancherConfig {
+	if config, ok := r.context.RancherConfig[r.name]; ok {
+		return config
+	}
+	return RancherConfig{}
+}
+
 func NewService(name string, config *project.ServiceConfig, context *Context) *RancherService {
 	return &RancherService{
 		name:          name,
@@ -66,14 +63,16 @@ func NewService(name string, config *project.ServiceConfig, context *Context) *R
 }
 
 func (r *RancherService) RancherService() (*rancherClient.Service, error) {
-	return r.findExisting(r.name)
+	return r.FindExisting(r.name)
 }
 
 func (r *RancherService) Create() error {
-	service, err := r.findExisting(r.name)
+	service, err := r.FindExisting(r.name)
 
 	if err == nil && service == nil {
 		service, err = r.createService()
+	} else if err == nil && service != nil {
+		err = r.setupLinks(service, service.State == "inactive")
 	}
 
 	return err
@@ -100,9 +99,31 @@ func (r *RancherService) up(create bool) error {
 		}
 	}()
 
-	service, err := r.findExisting(r.name)
+	service, err := r.FindExisting(r.name)
 	if err != nil {
 		return err
+	}
+
+	if r.Context().Rollback {
+		if service == nil {
+			return nil
+		}
+
+		_, err := r.rollback(service)
+		return err
+	}
+
+	if service != nil && create && r.shouldUpgrade(service) {
+		if r.context.Pull {
+			if err := r.Pull(); err != nil {
+				return err
+			}
+		}
+
+		service, err = r.upgrade(service, r.context.ForceUpgrade, r.context.Args)
+		if err != nil {
+			return err
+		}
 	}
 
 	if service == nil && !create {
@@ -112,11 +133,22 @@ func (r *RancherService) up(create bool) error {
 	if service == nil {
 		service, err = r.createService()
 	} else {
-		err = r.setupLinks(service)
+		err = r.setupLinks(service, true)
 	}
 
 	if err != nil {
 		return err
+	}
+
+	if service.State == "upgraded" && r.context.ConfirmUpgrade {
+		service, err = r.context.Client.Service.ActionFinishupgrade(service)
+		if err != nil {
+			return err
+		}
+		err = r.Wait(service)
+		if err != nil {
+			return err
+		}
 	}
 
 	if service.State == "active" {
@@ -132,7 +164,7 @@ func (r *RancherService) up(create bool) error {
 }
 
 func (r *RancherService) Down() error {
-	service, err := r.findExisting(r.name)
+	service, err := r.FindExisting(r.name)
 
 	if err == nil && service == nil {
 		return nil
@@ -151,7 +183,7 @@ func (r *RancherService) Down() error {
 }
 
 func (r *RancherService) Delete() error {
-	service, err := r.findExisting(r.name)
+	service, err := r.FindExisting(r.name)
 
 	if err == nil && service == nil {
 		return nil
@@ -197,7 +229,7 @@ func (r *RancherService) resolveServiceAndEnvironmentId(name string) (string, st
 	return parts[1], envs.Data[0].Id, nil
 }
 
-func (r *RancherService) findExisting(name string) (*rancherClient.Service, error) {
+func (r *RancherService) FindExisting(name string) (*rancherClient.Service, error) {
 	logrus.Debugf("Finding service %s", name)
 
 	name, environmentId, err := r.resolveServiceAndEnvironmentId(name)
@@ -225,143 +257,18 @@ func (r *RancherService) findExisting(name string) (*rancherClient.Service, erro
 	return &services.Data[0], nil
 }
 
-func (r *RancherService) createExternalService() (*rancherClient.Service, error) {
-	config, _ := r.context.RancherConfig[r.name]
-
-	_, err := r.context.Client.ExternalService.Create(&rancherClient.ExternalService{
-		Name:                r.name,
-		ExternalIpAddresses: config.ExternalIps,
-		Hostname:            config.Hostname,
-		EnvironmentId:       r.context.Environment.Id,
-		HealthCheck:         r.getHealthCheck(),
-	})
-
-	if err != nil {
-		return nil, err
-	}
-
-	return r.findExisting(r.name)
-}
-
-func (r *RancherService) createDnsService() (*rancherClient.Service, error) {
-	_, err := r.context.Client.DnsService.Create(&rancherClient.DnsService{
-		Name:              r.name,
-		EnvironmentId:     r.context.Environment.Id,
-		SelectorContainer: r.getSelectorContainer(),
-		SelectorLink:      r.getSelectorLink(),
-	})
-
-	if err != nil {
-		return nil, err
-	}
-
-	links, err := r.getServiceLinks()
-	if err != nil {
-		return nil, err
-	}
-
-	service, err := r.findExisting(r.name)
-	if err != nil {
-		return nil, err
-	}
-
-	if len(links) > 0 {
-		_, err = r.context.Client.Service.ActionSetservicelinks(service, &rancherClient.SetServiceLinksInput{
-			ServiceLinks: links,
-		})
-	}
-
-	return service, nil
-}
-
-func (r *RancherService) createLbService() (*rancherClient.Service, error) {
-	var lbConfig *rancherClient.LoadBalancerConfig
-
-	config, ok := r.context.RancherConfig[r.name]
-	if ok {
-		lbConfig = config.LoadBalancerConfig
-	}
-
-	launchConfig, err := r.createLaunchConfig(r.serviceConfig)
-	if err != nil {
-		return nil, err
-	}
-
-	launchConfig.ImageUuid = ""
-	// Write back to the ports passed in because the Docker parsing logic changes then
-	launchConfig.Ports = r.serviceConfig.Ports
-	launchConfig.Expose = r.serviceConfig.Expose
-
-	lbServiceOpts := &rancherClient.LoadBalancerService{
-		Name:               r.name,
-		LoadBalancerConfig: lbConfig,
-		LaunchConfig:       launchConfig,
-		Scale:              int64(r.getConfiguredScale()),
-		EnvironmentId:      r.context.Environment.Id,
-		SelectorContainer:  r.getSelectorContainer(),
-		SelectorLink:       r.getSelectorLink(),
-	}
-
-	if err := populateCerts(r.context.Client, lbServiceOpts, &config); err != nil {
-		return nil, err
-	}
-
-	if _, err = r.context.Client.LoadBalancerService.Create(lbServiceOpts); err != nil {
-		return nil, err
-	}
-
-	return r.findExisting(r.name)
-}
-
-func (r *RancherService) createNormalService() (*rancherClient.Service, error) {
-	secondaryLaunchConfigs := []interface{}{}
-
-	launchConfig, err := r.createLaunchConfig(r.serviceConfig)
-	if err != nil {
-		return nil, err
-	}
-
-	if secondaries, ok := r.context.SidekickInfo.primariesToSidekicks[r.name]; ok {
-		for _, secondaryName := range secondaries {
-			serviceConfig, ok := r.context.Project.Configs[secondaryName]
-			if !ok {
-				return nil, fmt.Errorf("Failed to find sidekick: %s", secondaryName)
-			}
-
-			launchConfig, err := r.createLaunchConfig(serviceConfig)
-			if err != nil {
-				return nil, err
-			}
-
-			var secondaryLaunchConfig rancherClient.SecondaryLaunchConfig
-			utils.Convert(launchConfig, &secondaryLaunchConfig)
-			secondaryLaunchConfig.Name = secondaryName
-
-			secondaryLaunchConfigs = append(secondaryLaunchConfigs, secondaryLaunchConfig)
-		}
-	}
-
-	return r.context.Client.Service.Create(&rancherClient.Service{
-		Name:                   r.name,
-		Metadata:               r.getMetadata(),
-		LaunchConfig:           launchConfig,
-		SecondaryLaunchConfigs: secondaryLaunchConfigs,
-		Scale:             int64(r.getConfiguredScale()),
-		EnvironmentId:     r.context.Environment.Id,
-		SelectorContainer: r.getSelectorContainer(),
-		SelectorLink:      r.getSelectorLink(),
-	})
-}
-
-func (r *RancherService) getMetadata() map[string]interface{} {
+func (r *RancherService) Metadata() map[string]interface{} {
 	if config, ok := r.context.RancherConfig[r.name]; ok {
-		return NestedMapsToMapInterface(config.Metadata)
+		return rUtils.NestedMapsToMapInterface(config.Metadata)
 	}
-	return nil
+	return map[string]interface{}{}
 }
 
-func (r *RancherService) getHealthCheck() *rancherClient.InstanceHealthCheck {
-	if config, ok := r.context.RancherConfig[r.name]; ok {
+func (r *RancherService) HealthCheck(service string) *rancherClient.InstanceHealthCheck {
+	if service == "" {
+		service = r.name
+	}
+	if config, ok := r.context.RancherConfig[service]; ok {
 		return config.HealthCheck
 	}
 
@@ -382,27 +289,21 @@ func (r *RancherService) getConfiguredScale() int {
 func (r *RancherService) createService() (*rancherClient.Service, error) {
 	logrus.Infof("Creating service %s", r.name)
 
-	var service *rancherClient.Service
-	var err error
-
-	switch r.serviceType() {
-	case externalServiceType:
-		service, err = r.createExternalService()
-	case lbServiceType:
-		service, err = r.createLbService()
-	case dnsServiceType:
-		service, err = r.createDnsService()
-	case rancherType:
-		service, err = r.createNormalService()
-	default:
-		return nil, fmt.Errorf("Unknown service type for %s", r.name)
-	}
-
+	factory, err := GetFactory(r)
 	if err != nil {
 		return nil, err
 	}
 
-	if err := r.setupLinks(service); err != nil {
+	if err := factory.Create(r); err != nil {
+		return nil, err
+	}
+
+	service, err := r.FindExisting(r.name)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := r.setupLinks(service, true); err != nil {
 		return nil, err
 	}
 
@@ -410,23 +311,27 @@ func (r *RancherService) createService() (*rancherClient.Service, error) {
 	return service, err
 }
 
-func (r *RancherService) serviceType() serviceType {
-	rancherConfig, _ := r.context.RancherConfig[r.name]
-
-	if len(rancherConfig.ExternalIps) > 0 || rancherConfig.Hostname != "" {
-		return externalServiceType
-	} else if r.serviceConfig.Image == LB_IMAGE {
-		return lbServiceType
-	} else if r.serviceConfig.Image == DNS_IMAGE {
-		return dnsServiceType
+func (r *RancherService) setupLinks(service *rancherClient.Service, update bool) error {
+	// Don't modify links for selector based linking, don't want to conflict
+	if service.SelectorLink != "" || FindServiceType(r) == ExternalServiceType {
+		return nil
 	}
 
-	return rancherType
-}
-
-func (r *RancherService) setupLinks(service *rancherClient.Service) error {
 	var err error
 	var links []interface{}
+
+	existingLinks, err := r.context.Client.ServiceConsumeMap.List(&rancherClient.ListOpts{
+		Filters: map[string]interface{}{
+			"serviceId": service.Id,
+		},
+	})
+	if err != nil {
+		return err
+	}
+
+	if len(existingLinks.Data) > 0 && !update {
+		return nil
+	}
 
 	if service.Type == rancherClient.LOAD_BALANCER_SERVICE_TYPE {
 		links, err = r.getLbLinks()
@@ -464,11 +369,11 @@ func (r *RancherService) getLbLinks() ([]interface{}, error) {
 	return result, nil
 }
 
-func (r *RancherService) getSelectorContainer() string {
+func (r *RancherService) SelectorContainer() string {
 	return r.serviceConfig.Labels.MapParts()["io.rancher.service.selector.container"]
 }
 
-func (r *RancherService) getSelectorLink() string {
+func (r *RancherService) SelectorLink() string {
 	return r.serviceConfig.Labels.MapParts()["io.rancher.service.selector.link"]
 }
 
@@ -479,7 +384,7 @@ func (r *RancherService) getLbLinkPorts(name string) ([]string, error) {
 		return []string{}, nil
 	}
 
-	return TrimSplit(v, ",", -1), nil
+	return rUtils.TrimSplit(v, ",", -1), nil
 }
 
 func (r *RancherService) getServiceLinks() ([]interface{}, error) {
@@ -513,13 +418,15 @@ func (r *RancherService) getLinks() (map[Link]string, error) {
 		name = strings.TrimSpace(name)
 		alias = strings.TrimSpace(alias)
 
-		linkedService, err := r.findExisting(name)
+		linkedService, err := r.FindExisting(name)
 		if err != nil {
 			return nil, err
 		}
 
 		if linkedService == nil {
-			logrus.Warnf("Failed to find service %s to link to", name)
+			if _, ok := r.context.Project.Configs[name]; !ok {
+				logrus.Warnf("Failed to find service %s to link to", name)
+			}
 		} else {
 			result[Link{
 				ServiceName: name,
@@ -531,147 +438,8 @@ func (r *RancherService) getLinks() (map[Link]string, error) {
 	return result, nil
 }
 
-func setupNetworking(netMode string, launchConfig *rancherClient.LaunchConfig) {
-	if netMode == "" {
-		launchConfig.NetworkMode = "managed"
-	} else if runconfig.IpcMode(netMode).IsContainer() {
-		// For some reason NetworkMode object is gone runconfig, but IpcMode works the same for this
-		launchConfig.NetworkMode = "container"
-		launchConfig.NetworkLaunchConfig = strings.TrimPrefix(netMode, "container:")
-	} else {
-		launchConfig.NetworkMode = netMode
-	}
-}
-
-func setupVolumesFrom(volumesFrom []string, launchConfig *rancherClient.LaunchConfig) {
-	launchConfig.DataVolumesFromLaunchConfigs = volumesFrom
-}
-
-func (r *RancherService) setupBuild(result *rancherClient.LaunchConfig, serviceConfig *project.ServiceConfig) error {
-	if serviceConfig.Build != "" {
-		result.Build = &rancherClient.DockerBuild{
-			Remote:     serviceConfig.Build,
-			Dockerfile: serviceConfig.Dockerfile,
-		}
-
-		needBuild := true
-		for _, remote := range project.ValidRemotes {
-			if strings.HasPrefix(serviceConfig.Build, remote) {
-				needBuild = false
-				break
-			}
-		}
-
-		if needBuild {
-			image, url, err := Upload(r.context, r.name)
-			if err != nil {
-				return err
-			}
-			logrus.Infof("Build for %s available at %s", r.name, url)
-			serviceConfig.Build = url
-
-			if serviceConfig.Image == "" {
-				serviceConfig.Image = image
-			}
-
-			result.Build = &rancherClient.DockerBuild{
-				Context:    url,
-				Dockerfile: serviceConfig.Dockerfile,
-			}
-			result.ImageUuid = "docker:" + image
-		} else if result.ImageUuid == "" {
-			result.ImageUuid = fmt.Sprintf("docker:%s_%s_%d", r.context.ProjectName, r.name, time.Now().UnixNano()/int64(time.Millisecond))
-		}
-	}
-
-	return nil
-}
-
-func (r *RancherService) createLaunchConfig(serviceConfig *project.ServiceConfig) (rancherClient.LaunchConfig, error) {
-	var result rancherClient.LaunchConfig
-
-	schemasUrl := strings.SplitN(r.context.Client.Schemas.Links["self"], "/schemas", 2)[0]
-	scriptsUrl := schemasUrl + "/scripts/transform"
-
-	config, hostConfig, err := docker.Convert(serviceConfig)
-	if err != nil {
-		return result, err
-	}
-
-	dockerContainer := &ContainerInspect{
-		Config:     config,
-		HostConfig: hostConfig,
-	}
-
-	dockerContainer.HostConfig.NetworkMode = runconfig.NetworkMode("")
-
-	if serviceConfig.Name != "" {
-		dockerContainer.Name = "/" + serviceConfig.Name
-	} else {
-		dockerContainer.Name = "/" + r.name
-	}
-
-	err = r.context.Client.Post(scriptsUrl, dockerContainer, &result)
-	if err != nil {
-		return result, err
-	}
-
-	result.HealthCheck = r.getHealthCheck()
-
-	setupNetworking(serviceConfig.Net, &result)
-	setupVolumesFrom(serviceConfig.VolumesFrom, &result)
-
-	err = r.setupBuild(&result, serviceConfig)
-	return result, err
-}
-
-func (r *RancherService) WaitFor(resource *rancherClient.Resource, output interface{}, transitioning func() string) error {
-	for {
-		if transitioning() != "yes" {
-			return nil
-		}
-
-		time.Sleep(150 * time.Millisecond)
-
-		err := r.context.Client.Reload(resource, output)
-		if err != nil {
-			return err
-		}
-	}
-}
-
-func (r *RancherService) Wait(service *rancherClient.Service) error {
-	for {
-		if service.Transitioning != "yes" {
-			return nil
-		}
-
-		time.Sleep(150 * time.Millisecond)
-
-		err := r.context.Client.Reload(&service.Resource, service)
-		if err != nil {
-			return err
-		}
-	}
-}
-
-func (r *RancherService) waitInstance(service *rancherClient.Instance) error {
-	for {
-		if service.Transitioning != "yes" {
-			return nil
-		}
-
-		time.Sleep(150 * time.Millisecond)
-
-		err := r.context.Client.Reload(&service.Resource, service)
-		if err != nil {
-			return err
-		}
-	}
-}
-
 func (r *RancherService) Scale(count int) error {
-	service, err := r.findExisting(r.name)
+	service, err := r.FindExisting(r.name)
 	if err != nil {
 		return err
 	}
@@ -710,7 +478,7 @@ func (r *RancherService) Containers() ([]project.Container, error) {
 }
 
 func (r *RancherService) containers() ([]rancherClient.Container, error) {
-	service, err := r.findExisting(r.name)
+	service, err := r.FindExisting(r.name)
 	if err != nil {
 		return nil, err
 	}
@@ -726,29 +494,28 @@ func (r *RancherService) containers() ([]rancherClient.Container, error) {
 }
 
 func (r *RancherService) Restart() error {
-	containers, err := r.containers()
+	service, err := r.FindExisting(r.name)
 	if err != nil {
 		return err
 	}
 
-	for _, container := range containers {
-		logrus.Infof("Restarting container: %s", container.Name)
-		instance, err := r.context.Client.Container.ActionRestart(&container)
-		if err != nil {
-			return err
-		}
+	service, err = r.context.Client.Service.ActionRestart(service, &rancherClient.ServiceRestart{
+		RollingRestartStrategy: rancherClient.RollingRestartStrategy{
+			BatchSize:      r.context.BatchSize,
+			IntervalMillis: r.context.Interval,
+		},
+	})
 
-		r.waitInstance(instance)
-		if instance.State != "running" {
-			return fmt.Errorf("Failed to restart %s, in state: %s", instance.Name, instance.State)
-		}
+	if err != nil {
+		logrus.Errorf("Failed to restart %s: %v", r.Name(), err)
+		return err
 	}
 
-	return nil
+	return r.Wait(service)
 }
 
 func (r *RancherService) Log() error {
-	service, err := r.findExisting(r.name)
+	service, err := r.FindExisting(r.name)
 	if err != nil || service == nil {
 		return err
 	}
@@ -840,7 +607,7 @@ func (r *RancherService) Info() (project.InfoSet, error) {
 func (r *RancherService) pullImage(image string, labels map[string]string) error {
 	taskOpts := &rancherClient.PullTask{
 		Mode:   "all",
-		Labels: ToMapInterface(labels),
+		Labels: rUtils.ToMapInterface(labels),
 		Image:  image,
 	}
 
@@ -878,7 +645,7 @@ func (r *RancherService) pullImage(image string, labels map[string]string) error
 
 func (r *RancherService) Pull() (err error) {
 	config := r.Config()
-	if config.Image == "" || r.serviceType() != rancherType {
+	if config.Image == "" || FindServiceType(r) != RancherType {
 		return
 	}
 
@@ -892,7 +659,7 @@ func (r *RancherService) Pull() (err error) {
 				continue
 			}
 
-			labels = MapUnion(labels, serviceConfig.Labels.MapParts())
+			labels = rUtils.MapUnion(labels, serviceConfig.Labels.MapParts())
 			if serviceConfig.Image != "" {
 				toPull[serviceConfig.Image] = true
 			}
@@ -913,6 +680,21 @@ func (r *RancherService) Pull() (err error) {
 
 	wg.Wait()
 	return
+}
+
+func appendHash(service *RancherService, labels map[string]interface{}) (map[string]interface{}, error) {
+	ret := map[string]interface{}{}
+	for k, v := range labels {
+		ret[k] = v
+	}
+
+	hashValue := "" //, err := hash(service)
+	//if err != nil {
+	//return nil, err
+	//}
+
+	ret[docker.HASH.Str()] = hashValue
+	return ret, nil
 }
 
 func printStatus(image string, printed map[string]string, current map[string]interface{}) bool {
@@ -942,13 +724,4 @@ func printStatus(image string, printed map[string]string, current map[string]int
 	}
 
 	return good
-}
-
-func TrimSplit(str, sep string, count int) []string {
-	result := []string{}
-	for _, i := range strings.SplitN(strings.TrimSpace(str), sep, count) {
-		result = append(result, strings.TrimSpace(i))
-	}
-
-	return result
 }
