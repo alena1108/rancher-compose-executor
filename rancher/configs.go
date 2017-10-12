@@ -40,7 +40,7 @@ func createLaunchConfigs(r *RancherService) (client.LaunchConfig, []client.Secon
 			secondaryLaunchConfig.Name = secondaryName
 
 			if secondaryLaunchConfig.Labels == nil {
-				secondaryLaunchConfig.Labels = map[string]interface{}{}
+				secondaryLaunchConfig.Labels = map[string]string{}
 			}
 			secondaryLaunchConfigs = append(secondaryLaunchConfigs, secondaryLaunchConfig)
 		}
@@ -110,7 +110,7 @@ func createLaunchConfig(r *RancherService, name string, serviceConfig *config.Se
 	}
 
 	if result.Labels == nil {
-		result.Labels = map[string]interface{}{}
+		result.Labels = map[string]string{}
 	}
 
 	result.Kind = serviceConfig.Type
@@ -125,7 +125,7 @@ func createLaunchConfig(r *RancherService, name string, serviceConfig *config.Se
 	}
 
 	if result.LogConfig.Config == nil {
-		result.LogConfig.Config = map[string]interface{}{}
+		result.LogConfig.Config = map[string]string{}
 	}
 
 	return result, err

@@ -77,10 +77,10 @@ func CreateLaunchConfig(name string, serviceConfig *config.ServiceConfig, c *cli
 	}*/
 
 	if result.Labels == nil {
-		result.Labels = map[string]interface{}{}
+		result.Labels = map[string]string{}
 	}
 	if result.LogConfig.Config == nil {
-		result.LogConfig.Config = map[string]interface{}{}
+		result.LogConfig.Config = map[string]string{}
 	}
 
 	result.Kind = serviceConfig.Type
