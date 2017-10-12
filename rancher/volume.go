@@ -112,14 +112,10 @@ func (v *Volume) EnsureItExists(ctx context.Context) error {
 }
 
 func (v *Volume) create(ctx context.Context) error {
-	driverOptions := map[string]interface{}{}
-	for k, v := range v.driverOptions {
-		driverOptions[k] = v
-	}
 	_, err := v.context.Client.VolumeTemplate.Create(&client.VolumeTemplate{
 		Name:         v.name,
 		Driver:       v.driver,
-		DriverOpts:   driverOptions,
+		DriverOpts:   v.driverOptions,
 		External:     v.external,
 		PerContainer: v.perContainer,
 		StackId:      v.context.Stack.Id,

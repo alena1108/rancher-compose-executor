@@ -478,7 +478,7 @@ func (r *RancherService) Client() *client.RancherClient {
 func (r *RancherService) pullImage(image string, labels map[string]string) error {
 	taskOpts := &client.PullTask{
 		Mode:   "all",
-		Labels: rUtils.ToMapInterface(labels),
+		Labels: labels,
 		Image:  image,
 	}
 
@@ -568,14 +568,9 @@ func appendHash(service *RancherService, existingLabels map[string]interface{}) 
 	return ret, nil
 }
 
-func printStatus(image string, printed map[string]string, current map[string]interface{}) bool {
+func printStatus(image string, printed map[string]string, current map[string]string) bool {
 	good := true
-	for host, objStatus := range current {
-		status, ok := objStatus.(string)
-		if !ok {
-			continue
-		}
-
+	for host, status := range current {
 		v := printed[host]
 		if status != "Done" {
 			good = false
