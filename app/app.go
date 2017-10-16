@@ -152,7 +152,7 @@ func UpCommand(factory ProjectFactory) cli.Command {
 			cli.IntFlag{
 				Name:  "batch-size",
 				Usage: "Number of containers to upgrade at once",
-				Value: 2,
+				Value: 1,
 			},
 			cli.IntFlag{
 				Name:  "interval",
